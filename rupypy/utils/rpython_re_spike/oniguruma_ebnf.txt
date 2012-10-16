@@ -1,0 +1,72 @@
+DOT: "\.";
+CHAR: "[^\d\\]";
+NUM: "\d";
+CLASS_BEGIN: "\[";
+CLASS_END: "\]";
+NEG_CLASS_BEGIN: "\[\^";
+SUBEXP_OPT: "\?[imxo]\:";
+
+regex: ["/"] sub_regex ["/"] OPTION?;
+meta_character: [BSL] CHAR; # in case this metacharacter is a number, we have to consider this as a backreference
+char_property: ["\\p{"] string ["}"];
+char_class: string;
+
+repetition: repetition_code rep_conf?;
+rep_conf: "+" | "?";
+repetition_code: "+" | "*" | "?" | n_times | n_or_more
+                 | m_or_less | n_atmost_m;            
+n_times: ["{"] CHAR ["}"];
+n_or_more: ["{"] CHAR [",}"];
+m_or_less: ["{,"] CHAR ["}"];
+n_atmost_m: ["{"] CHAR [","] CHAR ["}"];
+
+group: <named_group> | <anonymous_group> | <atomic_group> |
+       <pos_lookahead_group> | <neg_lookahead_group> |
+       <pos_lookbehind_group> | <neg_lookbehind_group> | <capture_group>;
+capture_group: ["("] SUBEXP_OPT? sub_regex [")"];
+named_group: ["(?<"] string [">"] sub_regex [")"]; 
+anonymous_group: ["(?:"] sub_regex [")"]; 
+atomic_group: ["(?>"] sub_regex [")"]; 
+pos_lookahead_group: ["(?="] sub_regex [")"];
+neg_lookahead_group: ["(?!"] sub_regex [")"];
+pos_lookbehind_group: ["?<="] sub_regex [")"];
+neg_lookbehind_group: ["(?<!"] sub_regex [")"]; 
+
+subexp_call: ["\\g"] direct_ref | ["\\g<"] direct ref [">"] |
+             ["\\k<-"] rel_ref [">"] |
+             ["\\k-"] rel_ref;
+back_reference: [BSL] direct_num_ref |
+                ["\\k<"] direct_ref nesting? [">"] | 
+                ["\\k"] direct_ref nesting? |
+                ["\\k<-"] rel_ref nesting? [">"] |
+                ["\\k-"] rel_ref nesting?;
+nesting: "+" string | "-" string;
+direct_ref: string; # may also be a num ref, postpone for later evaluation
+direct_num_ref: NUM+;
+rel_ref: NUM+;
+reference: back_reference | subexp_call;
+
+alternation: simple_regex ["|"] sub_regex;
+concatenation: basic_regex simple_regex;
+unicode_pattern: (CHAR CHAR CHAR CHAR) ([" "] CHAR CHAR CHAR CHAR)*;
+pattern: CHAR | ["\\u{"] unicode_pattern ["}"] | meta_character;
+basic_regex: elementary_regex repetition | <elementary_regex>;
+simple_regex: concatenation | <basic_regex>;
+sub_regex: alternation | <simple_regex>;
+elementary_regex: set | group | pattern | reference | ANY;
+
+set: <intersection> | <class> | <posix_class>;
+posix_class: <pos_posix> | <neg_posix>;
+pos_posix: [CLASS_BEGIN ":"] char_class [":" CLASS_END];
+neg_posix: [CLASS_BEGIN ":^"] char_class [":" CLASS_END];
+class: <negative_class> | <positive_class>; 
+positive_class: [CLASS_BEGIN] class_items [CLASS_END];
+negative_class: [NEG_CLASS_BEGIN] class_items [CLASS_END];
+class_items: (>class_item<)+;
+class_item: set | range | CHAR;
+range: CHAR ["-"] CHAR;
+intersection: range ["&&"] set | class ["&&"] set; # this is a bit odd
+
+string_elem: CHAR | NUM;
+string: string_elem (string_elem)*;
+BSL: "\\";
