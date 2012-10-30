@@ -31,22 +31,18 @@ class AttributeWriter(W_FunctionObject):
 
 
 class W_ModuleObject(W_RootObject):
-    _immutable_fields_ = [
-        "version?", "included_modules?[*]", "lexical_scope?", "klass?"
-    ]
+    _immutable_fields_ = ["version?", "included_modules?[*]", "klass?"]
 
     classdef = ClassDef("Module", W_RootObject.classdef)
 
-    def __init__(self, space, name, superclass):
+    def __init__(self, space, name):
         self.name = name
         self.klass = None
-        self.superclass = superclass
         self.version = VersionTag()
         self.methods_w = {}
         self.constants_w = {}
         self.class_variables = CellDict()
         self.instance_variables = CellDict()
-        self.lexical_scope = None
         self.included_modules = []
         self.descendants = []
 
@@ -54,13 +50,11 @@ class W_ModuleObject(W_RootObject):
         obj = super(W_ModuleObject, self).__deepcopy__(memo)
         obj.name = self.name
         obj.klass = copy.deepcopy(self.klass, memo)
-        obj.superclass = copy.deepcopy(self.superclass, memo)
         obj.version = copy.deepcopy(self.version, memo)
         obj.methods_w = copy.deepcopy(self.methods_w, memo)
         obj.constants_w = copy.deepcopy(self.constants_w, memo)
         obj.class_variables = copy.deepcopy(self.class_variables, memo)
         obj.instance_variables = copy.deepcopy(self.instance_variables, memo)
-        obj.lexical_scope = copy.deepcopy(self.lexical_scope, memo)
         obj.included_modules = copy.deepcopy(self.included_modules, memo)
         obj.descendants = copy.deepcopy(self.descendants, memo)
         return obj
@@ -106,32 +100,19 @@ class W_ModuleObject(W_RootObject):
     def _find_method_pure(self, space, method, version):
         return self.methods_w.get(method, None)
 
-    def set_lexical_scope(self, space, w_mod):
-        self.lexical_scope = w_mod
-
     def set_const(self, space, name, w_obj):
         self.mutated()
         self.constants_w[name] = w_obj
 
+    @jit.unroll_safe
     def find_const(self, space, name):
-        res = self._find_const_pure(name, self.version)
-        if res is None and self.lexical_scope is not None:
-            res = self.lexical_scope.find_lexical_const(space, name)
-        if res is None and self.superclass is not None:
-            res = self.superclass.find_inherited_const(space, name)
-        return res
-
-    def find_lexical_const(self, space, name):
-        res = self._find_const_pure(name, self.version)
-        if res is None and self.lexical_scope is not None:
-            return self.lexical_scope.find_lexical_const(space, name)
-        return res
-
-    def find_inherited_const(self, space, name):
-        res = self._find_const_pure(name, self.version)
-        if res is None and self.superclass is not None:
-            return self.superclass.find_inherited_const(space, name)
-        return res
+        w_res = self.find_local_const(space, name)
+        if w_res is None:
+            for w_mod in self.included_modules:
+                w_res = w_mod.find_local_const(space, name)
+                if w_res is not None:
+                    break
+        return w_res
 
     def find_local_const(self, space, name):
         return self._find_const_pure(name, self.version)
@@ -221,6 +202,12 @@ class W_ModuleObject(W_RootObject):
     def set_method_visibility(self, space, name, visibility):
         pass
 
+    @classdef.singleton_method("allocate")
+    def method_allocate(self, space):
+        # TODO: this should really store None for the name and all places
+        # reading the name should handle None
+        return W_ModuleObject(space, "")
+
     @classdef.method("to_s")
     def method_to_s(self, space):
         return space.newstr_fromstr(self.name)
@@ -247,6 +234,17 @@ class W_ModuleObject(W_RootObject):
         for w_arg in args_w:
             varname = space.symbol_w(w_arg)
             self.define_method(space, varname, AttributeReader("@" + varname))
+
+    @classdef.method("attr")
+    def method_attr(self, space, args_w):
+        if len(args_w) == 2 and (args_w[1] is space.w_true or args_w[1] is space.w_false):
+            [w_name, w_writable] = args_w
+            if space.is_true(w_writable):
+                self.method_attr_accessor(space, [w_name])
+            else:
+                self.method_attr_reader(space, [w_name])
+        else:
+            self.method_attr_reader(space, args_w)
 
     @classdef.method("module_function", name="symbol")
     def method_module_function(self, space, name):
@@ -319,9 +317,21 @@ class W_ModuleObject(W_RootObject):
     @classdef.method("const_defined?", const="str", inherit="bool")
     def method_const_definedp(self, space, const, inherit=True):
         if inherit:
-            return space.newbool(self.find_inherited_const(space, const) is not None)
+            return space.newbool(self.find_const(space, const) is not None)
         else:
-            return space.newbool(self._find_const_pure(const, self.version) is not None)
+            return space.newbool(self.find_local_const(space, const) is not None)
+
+    @classdef.method("const_get", const="symbol", inherit="bool")
+    def method_const_get(self, space, const, inherit=True):
+        if inherit:
+            w_res = self.find_const(space, const)
+        else:
+            w_res = self.find_local_const(space, const)
+        if w_res is None:
+            raise space.error(space.w_NameError,
+                "uninitialized constant %s::%s" % (self.name, const)
+            )
+        return w_res
 
     @classdef.method("method_defined?", name="str")
     def method_method_definedp(self, space, name):

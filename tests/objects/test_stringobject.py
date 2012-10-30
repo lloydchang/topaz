@@ -10,6 +10,12 @@ class TestStringObject(BaseRuPyPyTest):
         w_res = space.execute('return "abc" + "def" + "ghi"')
         assert space.str_w(w_res) == "abcdefghi"
 
+    def test_mul(self, space):
+        w_res = space.execute("return 'abc' * 2")
+        assert space.str_w(w_res) == "abcabc"
+        w_res = space.execute("return ('abc' << 'def') * 3")
+        assert space.str_w(w_res) == "abcdefabcdefabcdef"
+
     def test_to_s(self, space):
         w_res = space.execute('return "ABC".to_s')
         assert space.str_w(w_res) == "ABC"
@@ -87,6 +93,12 @@ class TestStringObject(BaseRuPyPyTest):
         return 'A' <=> A.new
         """)
         assert space.int_w(w_res) == 0
+
+    def test_eqlp(self, space):
+        w_res = space.execute("return 'abc'.eql? 2")
+        assert w_res is space.w_false
+        w_res = space.execute("return 'abc'.eql? 'abc'")
+        assert w_res is space.w_true
 
     def test_hash(self, space):
         w_res = space.execute("""
@@ -187,6 +199,9 @@ class TestStringObject(BaseRuPyPyTest):
         """)
         assert self.unwrap(space, w_res) == "abc123abc"
 
+        w_res = space.execute("return 'AbC123aBc'.downcase")
+        assert self.unwrap(space, w_res) == "abc123abc"
+
         w_res = space.execute("return '123'.downcase!")
         assert self.unwrap(space, w_res) is None
 
@@ -231,3 +246,32 @@ class TestStringObject(BaseRuPyPyTest):
         assert space.str_w(w_res) == "ID   : 200e14d6"
         w_res = space.execute("return '%05f' % 3.14")
         assert space.str_w(w_res) == "3.140000" 
+
+class TestStringMod(object):
+    def test_s(self, space):
+        w_res = space.execute("return '1 %s 1' % 'abc'")
+        assert space.str_w(w_res) == "1 abc 1"
+
+    def test_f(self, space):
+        w_res = space.execute("return ' %f ' % 1.23")
+        assert space.str_w(w_res) == " 1.230000 "
+
+    def test_f_width(self, space):
+        w_res = space.execute("return '%04f' % 1.23")
+        assert space.str_w(w_res) == "1.230000"
+
+    def test_d(self, space):
+        w_res = space.execute("return ' %d ' % 12")
+        assert space.str_w(w_res) == " 12 "
+
+    def test_d_width(self, space):
+        w_res = space.execute("return ' %05d' % 12")
+        assert space.str_w(w_res) == " 00012"
+        w_res = space.execute("return ' %01d' % 12")
+        assert space.str_w(w_res) == " 12"
+
+    def test_array_param(self, space):
+        w_res = space.execute("return '%d-%s' % [12, 'happy']")
+        assert space.str_w(w_res) == "12-happy"
+        w_res = space.execute("return '1%02d%02d%0s2d%04d' % [1, 2, 3, 4]")
+        assert space.str_w(w_res) == "10102030004"

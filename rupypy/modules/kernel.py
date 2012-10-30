@@ -7,7 +7,6 @@ from rupypy.error import RubyError
 from rupypy.module import Module, ModuleDef
 from rupypy.modules.process import Process
 from rupypy.objects.exceptionobject import W_ExceptionObject
-from rupypy.objects.hashobject import W_HashObject
 from rupypy.objects.stringobject import W_StringObject
 
 
@@ -39,19 +38,21 @@ class Kernel(Module):
     def function_proc(self, space, block):
         return space.newproc(block, False)
 
-    @moduledef.function("puts")
-    def function_puts(self, space, w_obj):
-        if w_obj is space.w_nil:
-            s = "nil"
-        else:
-            w_str = space.send(w_obj, space.newsymbol("to_s"))
-            s = space.str_w(w_str)
-        os.write(1, s)
-        os.write(1, "\n")
-        return space.w_nil
+    moduledef.app_method("""
+    def puts *args
+        $stdout.puts(*args)
+    end
+    """)
+
+    moduledef.app_method("""
+    def print *args
+        $stdout.print(*args)
+    end
+    """)
 
     @staticmethod
     def find_feature(space, path):
+        assert path is not None
         if not path.endswith(".rb"):
             path += ".rb"
 
@@ -138,20 +139,26 @@ class Kernel(Module):
 
         raise RubyError(w_exc)
 
-    @moduledef.method("Array")
-    def method_Array(self, space, w_arg):
-        if space.respond_to(w_arg, space.newsymbol("to_ary")):
-            return space.send(w_arg, space.newsymbol("to_ary"))
-        elif space.respond_to(w_arg, space.newsymbol("to_a")):
-            return space.send(w_arg, space.newsymbol("to_a"))
-        else:
-            return space.newarray([w_arg])
-
     moduledef.app_method("""
+    def Array arg
+        if arg.respond_to? :to_ary
+            arg.to_ary
+        elsif arg.respond_to? :to_a
+            arg.to_a
+        else
+            [arg]
+        end
+    end
+
     def String arg
         arg.to_s
     end
     module_function :String
+
+    def Integer arg
+        arg.to_i
+    end
+    module_function :Integer
     """)
 
     @moduledef.function("exit", status="int")
@@ -222,6 +229,14 @@ class Kernel(Module):
     def method_match(self, space, w_other):
         return space.w_nil
 
+    @moduledef.function("!~")
+    def method_not_match(self, space, w_other):
+        return space.newbool(not space.is_true(space.send(self, space.newsymbol("=~"), [w_other])))
+
+    @moduledef.function("eql?")
+    def method_eqlp(self, space, w_other):
+        return space.newbool(self is w_other)
+
     @moduledef.function("instance_variable_defined?", name="symbol")
     def method_instance_variable_definedp(self, space, name):
         return space.newbool(self.find_instance_var(space, name) is not None)
@@ -229,3 +244,27 @@ class Kernel(Module):
     @moduledef.method("respond_to?")
     def method_respond_top(self, space, w_name):
         return space.newbool(space.respond_to(self, w_name))
+
+    @moduledef.function("Float")
+    def method_Float(self, space, w_arg):
+        if w_arg is space.w_nil:
+            raise space.error(space.w_TypeError, "can't convert nil into Float")
+        elif space.is_kind_of(w_arg, space.w_numeric):
+            return space.newfloat(space.float_w(w_arg))
+        elif space.is_kind_of(w_arg, space.w_string):
+            string = space.str_w(w_arg).strip(' ')
+            try:
+                return space.newfloat(float(string))
+            except ValueError:
+                raise space.error(space.w_ArgumentError, "invalid value for Float(): %s" % string)
+        else:
+            return space.convert_type(w_arg, space.w_float, "to_f")
+
+    @moduledef.method("kind_of?")
+    @moduledef.method("is_a?")
+    def method_is_kind_ofp(self, space, w_mod):
+        return space.newbool(self.is_kind_of(space, w_mod))
+
+    @moduledef.method("instance_of?")
+    def method_instance_of(self, space, w_mod):
+        return space.newbool(space.getnonsingletonclass(self) is w_mod)

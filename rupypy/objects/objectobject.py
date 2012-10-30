@@ -26,10 +26,6 @@ class W_BaseObject(object):
         memo[id(self)] = obj
         return obj
 
-    @classmethod
-    def setup_class(cls, space, w_cls):
-        pass
-
     def getclass(self, space):
         return space.getclassobject(self.classdef)
 
@@ -43,6 +39,16 @@ class W_BaseObject(object):
     def is_true(self, space):
         return True
 
+    def find_const(self, space, name):
+        raise space.error(space.w_TypeError,
+            "%s is not a class/module" % space.str_w(space.send(self, space.newsymbol("inspect")))
+        )
+
+    def find_local_const(self, space, name):
+        raise space.error(space.w_TypeError,
+            "%s is not a class/module" % space.str_w(space.send(self, space.newsymbol("inspect")))
+        )
+
     @classdef.method("initialize")
     def method_initialize(self):
         return self
@@ -52,7 +58,7 @@ class W_BaseObject(object):
         return space.newint(compute_unique_id(self))
 
     @classdef.method("method_missing")
-    def method_method_missing(self, space, w_name):
+    def method_method_missing(self, space, w_name, args_w):
         name = space.symbol_w(w_name)
         class_name = space.str_w(space.send(self.getclass(space), space.newsymbol("name")))
         raise space.error(space.w_NoMethodError,
@@ -97,6 +103,10 @@ class W_RootObject(W_BaseObject):
 
     classdef = ClassDef("Object", W_BaseObject.classdef)
 
+    @classdef.setup_class
+    def setup_class(cls, space, w_cls):
+        space.w_top_self = W_Object(space, w_cls)
+
     @classdef.method("object_id")
     def method_object_id(self, space):
         return space.send(self, space.newsymbol("__id__"))
@@ -108,11 +118,6 @@ class W_RootObject(W_BaseObject):
     @classdef.method("extend")
     def method_extend(self, space, w_mod):
         self.getsingletonclass(space).method_include(space, w_mod)
-
-    @classdef.method("kind_of?")
-    @classdef.method("is_a?")
-    def method_is_kind_ofp(self, space, w_mod):
-        return space.newbool(self.is_kind_of(space, w_mod))
 
     @classdef.method("inspect")
     @classdef.method("to_s")
@@ -155,7 +160,7 @@ class W_Object(W_RootObject):
         if klass is None:
             klass = space.getclassfor(self.__class__)
         self.map = space.fromcache(MapTransitionCache).get_class_node(klass)
-        self.storage = []
+        self.storage = None
 
     def __deepcopy__(self, memo):
         obj = super(W_Object, self).__deepcopy__(memo)

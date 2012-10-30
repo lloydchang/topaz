@@ -4,6 +4,8 @@ from rupypy.objects.cellobject import W_CellObject
 
 
 class BaseFrame(object):
+    _attrs_ = ["backref", "escaped", "back_last_instr"]
+
     def __init__(self):
         self.backref = jit.vref_None
         self.escaped = False
@@ -12,11 +14,11 @@ class BaseFrame(object):
 class Frame(BaseFrame):
     _virtualizable2_ = [
         "bytecode", "locals_w[*]", "stack_w[*]", "stackpos", "w_self",
-        "w_scope", "block", "cells[*]", "lastblock",
+        "w_scope", "block", "cells[*]", "lastblock", "lexical_scope", "last_instr",
     ]
 
     @jit.unroll_safe
-    def __init__(self, bytecode, w_self, w_scope, block, parent_interp):
+    def __init__(self, bytecode, w_self, w_scope, lexical_scope, block, parent_interp):
         self = jit.hint(self, fresh_virtualizable=True, access_directly=True)
         BaseFrame.__init__(self)
         self.bytecode = bytecode
@@ -26,6 +28,7 @@ class Frame(BaseFrame):
         self.stackpos = 0
         self.w_self = w_self
         self.w_scope = w_scope
+        self.lexical_scope = lexical_scope
         self.block = block
         self.parent_interp = parent_interp
         self.lastblock = None
@@ -52,8 +55,11 @@ class Frame(BaseFrame):
     def handle_args(self, space, bytecode, args_w, block):
         from rupypy.interpreter import Interpreter
 
-        assert len(args_w) >= (len(bytecode.arg_locs) - len(bytecode.defaults))
-        assert bytecode.splat_arg_pos != -1 or 0 <= len(bytecode.arg_locs) - len(args_w)
+        if (len(args_w) < (len(bytecode.arg_locs) - len(bytecode.defaults)) or
+            (bytecode.splat_arg_pos == -1 and len(args_w) > len(bytecode.arg_locs))):
+            raise space.error(space.w_ArgumentError,
+                "wrong number of arguments (%d for %d)" % (len(args_w), len(bytecode.arg_locs) - len(bytecode.defaults))
+            )
 
         ec = space.getexecutioncontext()
 
@@ -126,8 +132,12 @@ class Frame(BaseFrame):
     def get_filename(self):
         return self.bytecode.filepath
 
-    def get_lineno(self, last_instructions, last_instr_idx):
-        return self.bytecode.lineno_table[last_instructions[last_instr_idx]]
+    def get_lineno(self, prev_frame):
+        if prev_frame is None:
+            instr = self.last_instr
+        else:
+            instr = prev_frame.back_last_instr
+        return self.bytecode.lineno_table[instr]
 
     def get_code_name(self):
         return self.bytecode.name
@@ -147,8 +157,8 @@ class BuiltinFrame(BaseFrame):
     def get_filename(self):
         return self.backref().get_filename()
 
-    def get_lineno(self, last_instructions, last_instr_idx):
-        return self.backref().get_lineno(last_instructions, last_instr_idx + 1)
+    def get_lineno(self, prev_frame):
+        return self.backref().get_lineno(self)
 
     def get_code_name(self):
         return self.name

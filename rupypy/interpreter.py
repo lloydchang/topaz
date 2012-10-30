@@ -4,6 +4,7 @@ from pypy.rlib.objectmodel import we_are_translated, specialize, newlist_hint
 
 from rupypy import consts
 from rupypy.error import RubyError
+from rupypy.executioncontext import IntegerWrapper
 from rupypy.objects.arrayobject import W_ArrayObject
 from rupypy.objects.blockobject import W_BlockObject
 from rupypy.objects.classobject import W_ClassObject
@@ -13,31 +14,47 @@ from rupypy.objects.moduleobject import W_ModuleObject
 from rupypy.objects.objectobject import W_BaseObject
 from rupypy.objects.procobject import W_ProcObject
 from rupypy.objects.stringobject import W_StringObject
+from rupypy.scope import StaticScope
 
 
-def get_printable_location(pc, bytecode):
+def get_printable_location(pc, bytecode, block_bytecode):
     return "%s at %s" % (bytecode.name, consts.BYTECODE_NAMES[ord(bytecode.code[pc])])
 
 
 class Interpreter(object):
     jitdriver = jit.JitDriver(
-        greens=["pc", "bytecode"],
+        greens=["pc", "bytecode", "block_bytecode"],
         reds=["self", "frame"],
         virtualizables=["frame"],
         get_printable_location=get_printable_location,
     )
+
+    def get_block_bytecode(self, block):
+        return block.bytecode if block is not None else None
 
     def interpret(self, space, frame, bytecode):
         pc = 0
         try:
             while True:
                 self.jitdriver.jit_merge_point(
-                    self=self, bytecode=bytecode, frame=frame, pc=pc
+                    self=self, bytecode=bytecode, frame=frame, pc=pc,
+                    block_bytecode=self.get_block_bytecode(frame.block),
                 )
+                frame.last_instr = pc
+                # Why do we wrap the PC in an object? The JIT has store
+                # sinking, but when it encounters a guard it usually performs
+                # all pending stores, *execpt* if the value is a virtual, then
+                # it doesn't, so we make this store be of a virtual, in order
+                # to ensure the JIT sinks the store.
+                space.getexecutioncontext().last_instr_ref = IntegerWrapper(pc)
                 try:
                     pc = self.handle_bytecode(space, pc, frame, bytecode)
                 except RubyError as e:
                     pc = self.handle_ruby_error(space, pc, frame, bytecode, e)
+                except RaiseReturn as e:
+                    pc = self.handle_raise_return(space, pc, frame, bytecode, e)
+                except RaiseBreak as e:
+                    pc = self.handle_raise_break(space, pc, frame, bytecode, e)
         except RaiseReturn as e:
             if e.parent_interp is self:
                 return e.w_value
@@ -78,23 +95,43 @@ class Interpreter(object):
             raise NotImplementedError
 
         method = getattr(self, name)
-        res = method(space, bytecode, frame, pc, *args)
+        try:
+            res = method(space, bytecode, frame, pc, *args)
+        except RaiseBreak as e:
+            if e.parent_interp is not self:
+                raise
+            frame.push(e.w_value)
+            res = None
         if res is not None:
             pc = res
         return pc
 
     def handle_ruby_error(self, space, pc, frame, bytecode, e):
-        e.w_value.last_instructions.append(pc)
         block = frame.unrollstack(ApplicationException.kind)
         if block is None:
             raise e
         unroller = ApplicationException(e)
         return block.handle(space, frame, unroller)
 
+    def handle_raise_return(self, space, pc, frame, bytecode, e):
+        block = frame.unrollstack(RaiseReturnValue.kind)
+        if block is None:
+            raise e
+        unroller = RaiseReturnValue(e.parent_interp, e.w_value)
+        return block.handle(space, frame, unroller)
+
+    def handle_raise_break(self, space, pc, frame, bytecode, e):
+        block = frame.unrollstack(RaiseBreakValue.kind)
+        if block is None:
+            raise e
+        unroller = RaiseBreakValue(e.parent_interp, e.w_value)
+        return block.handle(space, frame, unroller)
+
     def jump(self, space, bytecode, frame, cur_pc, target_pc):
         if target_pc < cur_pc:
             self.jitdriver.can_enter_jit(
                 self=self, bytecode=bytecode, frame=frame, pc=target_pc,
+                block_bytecode=self.get_block_bytecode(frame.block),
             )
         return target_pc
 
@@ -149,6 +186,29 @@ class Interpreter(object):
             frame.push(space.newstr_fromstr("constant"))
         else:
             frame.push(space.w_nil)
+
+    def LOAD_LOCAL_CONSTANT(self, space, bytecode, frame, pc, idx):
+        frame.pop()
+        w_name = bytecode.consts_w[idx]
+        name = space.symbol_w(w_name)
+        frame.push(space.find_lexical_const(jit.promote(frame.lexical_scope), name))
+
+    @jit.unroll_safe
+    def DEFINED_LOCAL_CONSTANT(self, space, bytecode, frame, pc, idx):
+        w_name = bytecode.consts_w[idx]
+        frame.pop()
+        scope = jit.promote(frame.lexical_scope)
+        while scope is not None:
+            w_mod = scope.w_mod
+            if space.is_true(space.send(w_mod, space.newsymbol("const_defined?"), [w_name])):
+                frame.push(space.newstr_fromstr("constant"))
+                break
+            scope = scope.backscope
+        else:
+            if space.is_true(space.send(space.w_object, space.newsymbol("const_defined?"), [w_name])):
+                frame.push(space.newstr_fromstr("constant"))
+            else:
+                frame.push(space.w_nil)
 
     def LOAD_INSTANCE_VAR(self, space, bytecode, frame, pc, idx):
         w_name = bytecode.consts_w[idx]
@@ -205,19 +265,9 @@ class Interpreter(object):
         items_w = frame.popitemsreverse(n_items)
         frame.push(space.newarray(items_w))
 
-    @jit.unroll_safe
     def BUILD_STRING(self, space, bytecode, frame, pc, n_items):
         items_w = frame.popitemsreverse(n_items)
-        total_length = 0
-        for w_item in items_w:
-            assert isinstance(w_item, W_StringObject)
-            total_length += w_item.length()
-
-        storage = newlist_hint(total_length)
-        for w_item in items_w:
-            assert isinstance(w_item, W_StringObject)
-            w_item.strategy.extend_into(w_item.str_storage, storage)
-        frame.push(space.newstr_fromchars(storage))
+        frame.push(space.newstr_fromstrs(items_w))
 
     def BUILD_HASH(self, space, bytecode, frame, pc):
         frame.push(space.newhash())
@@ -237,7 +287,7 @@ class Interpreter(object):
     def BUILD_FUNCTION(self, space, bytecode, frame, pc):
         w_code = frame.pop()
         w_name = frame.pop()
-        w_func = space.newfunction(w_name, w_code)
+        w_func = space.newfunction(w_name, w_code, frame.lexical_scope)
         frame.push(w_func)
 
     @jit.unroll_safe
@@ -246,7 +296,7 @@ class Interpreter(object):
         w_code = frame.pop()
         assert isinstance(w_code, W_CodeObject)
         block = W_BlockObject(
-            w_code, frame.w_self, frame.w_scope, cells, frame.block, self
+            w_code, frame.w_self, frame.w_scope, frame.lexical_scope, cells, frame.block, self
         )
         frame.push(block)
 
@@ -256,14 +306,19 @@ class Interpreter(object):
         w_scope = frame.pop()
 
         name = space.symbol_w(w_name)
-        w_cls = w_scope.find_local_const(self, name)
+        w_cls = w_scope.find_local_const(space, name)
         if w_cls is None:
             if superclass is space.w_nil:
                 superclass = space.w_object
+            if not space.is_kind_of(superclass, space.w_class):
+                raise space.error(space.w_TypeError,
+                    "wrong argument type %s (expected Class)" % space.getclass(superclass).name
+                )
             assert isinstance(superclass, W_ClassObject)
             w_cls = space.newclass(name, superclass)
             space.set_const(w_scope, name, w_cls)
-            space.set_lexical_scope(w_cls, w_scope)
+        elif not space.is_kind_of(w_cls, space.w_class):
+            raise space.error(space.w_TypeError, "%s is not a class" % name)
 
         frame.push(w_cls)
 
@@ -277,10 +332,11 @@ class Interpreter(object):
         if w_mod is None:
             w_mod = space.newmodule(name)
             space.set_const(w_scope, name, w_mod)
-            space.set_lexical_scope(w_mod, w_scope)
+        elif not space.is_kind_of(w_mod, space.w_module) or space.is_kind_of(w_mod, space.w_class):
+            raise space.error(space.w_TypeError, "%s is not a module" % name)
 
         assert isinstance(w_bytecode, W_CodeObject)
-        sub_frame = space.create_frame(w_bytecode, w_mod, w_mod)
+        sub_frame = space.create_frame(w_bytecode, w_mod, w_mod, StaticScope(w_mod, frame.lexical_scope))
         with space.getexecutioncontext().visit_frame(sub_frame):
             space.execute_frame(sub_frame, w_bytecode)
 
@@ -368,15 +424,16 @@ class Interpreter(object):
         w_obj.attach_method(space, space.symbol_w(w_name), w_func)
         frame.push(space.w_nil)
 
+    @jit.unroll_safe
     def EVALUATE_CLASS(self, space, bytecode, frame, pc):
         w_bytecode = frame.pop()
         w_cls = frame.pop()
         assert isinstance(w_bytecode, W_CodeObject)
-        sub_frame = space.create_frame(w_bytecode, w_cls, w_cls)
+        sub_frame = space.create_frame(w_bytecode, w_cls, w_cls, StaticScope(w_cls, frame.lexical_scope), block=frame.block)
         with space.getexecutioncontext().visit_frame(sub_frame):
-            space.execute_frame(sub_frame, w_bytecode)
+            w_res = space.execute_frame(sub_frame, w_bytecode)
 
-        frame.push(space.w_nil)
+        frame.push(w_res)
 
     @jit.unroll_safe
     def SEND(self, space, bytecode, frame, pc, meth_idx, num_args):
@@ -407,9 +464,19 @@ class Interpreter(object):
         w_block = frame.pop()
         args_w = space.listview(frame.pop())
         w_receiver = frame.pop()
-        assert isinstance(w_block, W_BlockObject)
+        if w_block is space.w_nil:
+            w_block = None
+        else:
+            assert isinstance(w_block, W_BlockObject)
         w_res = space.send(w_receiver, bytecode.consts_w[meth_idx], args_w, block=w_block)
         frame.push(w_res)
+
+    def DEFINED_METHOD(self, space, bytecode, frame, pc, meth_idx):
+        w_obj = frame.pop()
+        if space.respond_to(w_obj, bytecode.consts_w[meth_idx]):
+            frame.push(space.newstr_fromstr("method"))
+        else:
+            frame.push(space.w_nil)
 
     def SEND_SUPER(self, space, bytecode, frame, pc, meth_idx, num_args):
         args_w = frame.popitemsreverse(num_args)
@@ -442,11 +509,6 @@ class Interpreter(object):
             else:
                 return block.handle(space, frame, unroller)
         return pc
-
-    def COMPARE_EXC(self, space, bytecode, frame, pc):
-        w_expected = frame.pop()
-        w_actual = frame.peek()
-        frame.push(space.newbool(w_expected is space.getclass(w_actual)))
 
     def POP_BLOCK(self, space, bytecode, frame, pc):
         block = frame.popblock()
@@ -523,6 +585,18 @@ class Interpreter(object):
         frame.pop()
         return frame.unrollstack_and_jump(space, ContinueLoop(target_pc))
 
+    def BREAK_LOOP(self, space, bytecode, frame, pc):
+        w_obj = frame.pop()
+        return frame.unrollstack_and_jump(space, BreakLoop(w_obj))
+
+    def RAISE_BREAK(self, space, bytecode, frame, pc):
+        w_value = frame.pop()
+        block = frame.unrollstack(RaiseBreakValue.kind)
+        if block is None:
+            raise RaiseBreak(frame.parent_interp, w_value)
+        unroller = RaiseBreakValue(frame.parent_interp, w_value)
+        return block.handle(space, frame, unroller)
+
     def UNREACHABLE(self, space, bytecode, frame, pc):
         raise Exception
 
@@ -533,6 +607,12 @@ class Return(Exception):
 
 
 class RaiseReturn(Exception):
+    def __init__(self, parent_interp, w_value):
+        self.parent_interp = parent_interp
+        self.w_value = w_value
+
+
+class RaiseBreak(Exception):
     def __init__(self, parent_interp, w_value):
         self.parent_interp = parent_interp
         self.w_value = w_value
@@ -580,6 +660,24 @@ class ContinueLoop(SuspendedUnroller):
         self.target_pc = target_pc
 
 
+class BreakLoop(SuspendedUnroller):
+    kind = 1 << 4
+
+    def __init__(self, w_value):
+        self.w_value = w_value
+
+
+class RaiseBreakValue(SuspendedUnroller):
+    kind = 1 << 5
+
+    def __init__(self, parent_interp, w_value):
+        self.parent_interp = parent_interp
+        self.w_value = w_value
+
+    def nomoreblocks(self):
+        raise RaiseBreak(self.parent_interp, self.w_value)
+
+
 class FrameBlock(object):
     def __init__(self, target_pc, lastblock, stackdepth):
         self.target_pc = target_pc
@@ -594,7 +692,7 @@ class FrameBlock(object):
 
 
 class LoopBlock(FrameBlock):
-    handling_mask = ContinueLoop.kind
+    handling_mask = ContinueLoop.kind | BreakLoop.kind
 
     def cleanup(self, space, frame):
         self.cleanupstack(frame)
@@ -603,6 +701,10 @@ class LoopBlock(FrameBlock):
         if isinstance(unroller, ContinueLoop):
             frame.lastblock = self
             return unroller.target_pc
+        elif isinstance(unroller, BreakLoop):
+            self.cleanupstack(frame)
+            frame.push(unroller.w_value)
+            return self.target_pc
         else:
             raise SystemError
 

@@ -1,6 +1,12 @@
+from pypy.rlib.debug import check_regular_int
+from pypy.rlib.rarithmetic import ovfcheck
+from pypy.rlib.rbigint import rbigint
+from pypy.rpython.lltypesystem import lltype, rffi
+
 from rupypy.module import ClassDef
 from rupypy.objects.floatobject import W_FloatObject
 from rupypy.objects.integerobject import W_IntegerObject
+from rupypy.objects.numericobject import W_NumericObject
 from rupypy.objects.objectobject import W_RootObject
 
 
@@ -22,6 +28,7 @@ class W_FixnumObject(W_RootObject):
     classdef = ClassDef("Fixnum", W_IntegerObject.classdef)
 
     def __init__(self, space, intvalue):
+        check_regular_int(intvalue)
         self.intvalue = intvalue
 
     def __deepcopy__(self, memo):
@@ -31,6 +38,9 @@ class W_FixnumObject(W_RootObject):
 
     def int_w(self, space):
         return self.intvalue
+
+    def bigint_w(self, space):
+        return rbigint.fromint(self.intvalue)
 
     def float_w(self, space):
         return float(self.intvalue)
@@ -46,6 +56,7 @@ class W_FixnumObject(W_RootObject):
         storage = space.fromcache(FixnumStorage).get_or_create(space, self.intvalue)
         storage.set_instance_var(space, name, w_value)
 
+    @classdef.method("inspect")
     @classdef.method("to_s")
     def method_to_s(self, space):
         return space.newstr_fromstr(str(self.intvalue))
@@ -64,7 +75,16 @@ class W_FixnumObject(W_RootObject):
         if isinstance(w_other, W_FloatObject):
             return space.newfloat(self.intvalue + space.float_w(w_other))
         else:
-            return space.newint(self.intvalue + space.int_w(w_other))
+            other = space.int_w(w_other)
+            try:
+                value = ovfcheck(self.intvalue + other)
+            except OverflowError:
+                return space.send(
+                    space.newbigint_fromint(self.intvalue), space.newsymbol("+"),
+                    [w_other]
+                )
+            else:
+                return space.newint(value)
 
     @classdef.method("-")
     def method_sub(self, space, w_other):
@@ -75,7 +95,15 @@ class W_FixnumObject(W_RootObject):
 
     @classdef.method("*", other="int")
     def method_mul(self, space, other):
-        return space.newint(self.intvalue * other)
+        try:
+            value = ovfcheck(self.intvalue * other)
+        except OverflowError:
+            return space.send(
+                space.newbigint_fromint(self.intvalue), space.newsymbol("*"),
+                [space.newint(other)]
+            )
+        else:
+            return space.newint(value)
 
     @classdef.method("/", other="int")
     def method_div(self, space, other):
@@ -86,12 +114,32 @@ class W_FixnumObject(W_RootObject):
                 "divided by 0"
             )
 
+    @classdef.method("%", other="int")
+    def method_mod(self, space, other):
+        return space.newint(self.intvalue % other)
+
     @classdef.method("<<", other="int")
     def method_left_shift(self, space, other):
         if other < 0:
             return space.newint(self.intvalue >> -other)
         else:
-            return space.newint(self.intvalue << other)
+            try:
+                value = ovfcheck(self.intvalue << other)
+            except OverflowError:
+                return space.send(
+                    space.newbigint_fromint(self.intvalue), space.newsymbol("<<"),
+                    [space.newint(other)]
+                )
+            else:
+                return space.newint(value)
+
+    @classdef.method("&", other="int")
+    def method_and(self, space, other):
+        return space.newint(self.intvalue & other)
+
+    @classdef.method("^", other="int")
+    def method_xor(self, space, other):
+        return space.newint(self.intvalue ^ other)
 
     @classdef.method("==")
     def method_eq(self, space, w_other):
@@ -113,6 +161,19 @@ class W_FixnumObject(W_RootObject):
     @classdef.method(">", other="int")
     def method_gt(self, space, other):
         return space.newbool(self.intvalue > other)
+
+    @classdef.method("<=")
+    def method_lte(self, space, w_other):
+        if isinstance(w_other, W_FloatObject):
+            return space.newbool(self.intvalue <= space.float_w(w_other))
+        elif isinstance(w_other, W_FixnumObject):
+            return space.newbool(self.intvalue <= w_other.intvalue)
+        else:
+            return W_NumericObject.retry_binop_coercing(space, self, w_other, "<=", raise_error=True)
+
+    @classdef.method(">=", other="int")
+    def method_gte(self, space, other):
+        return space.newbool(self.intvalue >= other)
 
     @classdef.method("-@")
     def method_neg(self, space):
@@ -140,13 +201,16 @@ class W_FixnumObject(W_RootObject):
     def method_hash(self, space):
         return self
 
-    @classdef.method("zero?")
-    def method_zerop(self, space):
-        return space.newbool(self.intvalue == 0)
+    @classdef.method("size")
+    def method_size(self, space):
+        return space.newint(rffi.sizeof(lltype.typeOf(self.intvalue)))
 
-    @classdef.method("nonzero?")
-    def method_nonzerop(self, space):
-        return space.newbool(self.intvalue != 0)
+    @classdef.method("coerce")
+    def method_coerce(self, space, w_other):
+        if space.getclass(w_other) is space.getclass(self):
+            return space.newarray([w_other, self])
+        else:
+            return space.newarray([space.send(self, space.newsymbol("Float"), [w_other]), self])
 
     classdef.app_method("""
     def next
@@ -156,9 +220,7 @@ class W_FixnumObject(W_RootObject):
     def succ
         self + 1
     end
-    """)
 
-    classdef.app_method("""
     def times
         i = 0
         while i < self
@@ -166,9 +228,23 @@ class W_FixnumObject(W_RootObject):
             i += 1
         end
     end
-    """)
 
-    classdef.app_method("""
+    def zero?
+        self == 0
+    end
+
+    def nonzero?
+        self != 0
+    end
+
+    def even?
+        self % 2 == 0
+    end
+
+    def odd?
+        self % 2 != 0
+    end
+
     def __id__
         self * 2 + 1
     end
