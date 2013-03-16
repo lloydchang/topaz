@@ -11,7 +11,7 @@ from topaz.objects.objectobject import W_Object
 from topaz.objects.ioobject import W_IOObject
 from topaz.objects.stringobject import W_StringObject
 from topaz.system import IS_WINDOWS
-from topaz.utils.ll_file import O_BINARY, ftruncate, isdir, fchmod
+from topaz.utils.ll_file import O_BINARY, isdir, fchmod
 from topaz.utils.filemode import map_filemode
 
 
@@ -222,7 +222,7 @@ class W_FileObject(W_IOObject):
     @classdef.method("truncate", length="int")
     def method_truncate(self, space, length):
         self.ensure_not_closed(space)
-        ftruncate(self.fd, length)
+        self.stream.truncate(length)
         return space.newint(0)
 
     @classdef.method("chmod", mode="int")
